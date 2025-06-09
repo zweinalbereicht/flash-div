@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from flashdiv.flows.flow_net import FlowNet
+#from flashdiv.flows.flow_net import FlowNet
+from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 from einops import rearrange, repeat, reduce
 import torch.nn.functional as F
 

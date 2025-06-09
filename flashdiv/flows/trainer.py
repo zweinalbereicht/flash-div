@@ -52,9 +52,11 @@ class FlowTrainer(LightningModule):
         return torch.optim.Adam(self.flow_model.parameters(), lr=self.learning_rate)
 
 class DistillationTrainer(LightningModule):
-    def __init__(self, flow_model, learning_rate=1e-3):
+    def __init__(self, flow_model, parent_model,  learning_rate=1e-3):
         super().__init__()
         self.flow_model = flow_model
+        self.parent_model = parent_model
+        self.parent_model.eval()  # Ensure parent model is in eval mode to avoid computing gradients
         self.learning_rate = learning_rate
         self.save_hyperparameters()
 
@@ -62,21 +64,70 @@ class DistillationTrainer(LightningModule):
         return self.flow_model(x, t)
 
     def training_step(self, batch, batch_idx):
-        x, t, y = batch
-        pred = self.flow_model(x, t)
-        loss = nn.MSELoss()(pred, y)
-        self.log("train_loss", loss.item(), on_step = False, on_epoch = True)
+        base, target = batch
+        t = torch.rand(base.shape[0], device=base.device)  # shape: [batch]
+        # Broadcast t to shape [batch, N, D] for interpolation
+        tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
+        xt = base * (1 - tr) + target * tr  # [batch, N, D]
+        xt.requires_grad_()
+        v = target - base
+        vparent = self.parent_model(xt, t)  # Use parent model to get target velocity
+        vt = self.flow_model(xt, t)
+        loss = nn.MSELoss()(v - vparent,vt)  # Example loss: minimize the discrepency between the flow model and parent model
+        v_squared_norm = ((v - vparent) ** 2).mean()
+        self.log("train_loss", loss/v_squared_norm, on_step = True, on_epoch = True)
         return loss
 
+    # def on_after_backward(self):
+    #     # Access gradient after backward
+    #     if hasattr(self, "_last_xs") and self._last_xs.grad is not None:
+    #         grad_mean = self._last_xs.grad.abs().mean().item()
+    #         print(f"[Gradient check] ∂loss/∂xs.mean(): {grad_mean:.4e}")
+    #     else:
+    #         print("[Gradient check] No gradient on xs!")
+
     def validation_step(self, batch, batch_idx):
-        x, t, y = batch
-        pred = self.flow_model(x, t)
-        loss = nn.MSELoss()(pred, y)
-        self.log("val_loss", loss.item(), on_step = False, on_epoch = True)
+        base, target = batch
+        t = torch.rand(base.shape[0], device=base.device)
+        tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
+        xt = base * (1 - tr) + target * tr
+        v = target - base
+        vparent = self.parent_model(xt, t)  # Use parent model to get target velocity
+        vt = self.flow_model(xt, t)
+        loss = nn.MSELoss()(v - vparent,vt)  # Example loss: minimize the discrepency between the flow model and parent model
+        v_squared_norm = ((v - vparent) ** 2).mean()
+        self.log("val_loss", loss/v_squared_norm, on_step = False, on_epoch = True)
         return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.flow_model.parameters(), lr=self.learning_rate)
+
+# class DistillationTrainer(LightningModule):
+#     def __init__(self, flow_model, learning_rate=1e-3):
+#         super().__init__()
+#         self.flow_model = flow_model
+#         self.learning_rate = learning_rate
+#         self.save_hyperparameters()
+
+#     def forward(self, x, t):
+#         return self.flow_model(x, t)
+
+#     def training_step(self, batch, batch_idx):
+#         x, t, y = batch
+#         pred = self.flow_model(x, t)
+#         loss = nn.MSELoss()(pred, y)
+#         self.log("train_loss", loss.item(), on_step = False, on_epoch = True)
+#         return loss
+
+#     def validation_step(self, batch, batch_idx):
+#         x, t, y = batch
+#         pred = self.flow_model(x, t)
+#         loss = nn.MSELoss()(pred, y)
+#         self.log("val_loss", loss.item(), on_step = False, on_epoch = True)
+#         return loss
+
+#     def configure_optimizers(self):
+#         return torch.optim.Adam(self.flow_model.parameters(), lr=self.learning_rate)
 
 # we can implement the teacher student training here.
 # Ie at chaque training stap just infer everything from the teacher

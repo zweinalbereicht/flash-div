@@ -80,6 +80,8 @@ class FlowNet(nn.Module):
 
         if 'method' not in  kwargs:
             kwargs['method'] = 'euler'
+        if 'options' not in kwargs:
+            kwargs['options'] = {'step_size': 1 / 100}
 
         state0 = torch.cat(
             (x0,
