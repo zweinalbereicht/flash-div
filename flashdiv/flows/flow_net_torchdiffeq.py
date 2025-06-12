@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 from einops import rearrange, repeat, reduce
-from torch.func import jvp
+from torch.func import jvp, jacrev, vmap
 # import ode solver class
 from torchdiffeq import odeint
 
@@ -15,7 +15,7 @@ class FlowNet(nn.Module):
         raise NotImplementedError("Override this method in subclasses")
 
     @torch.no_grad()
-    def divergence2(self, x,t, div_samples=int(1e3)):
+    def divergence_hutch(self, x,t, div_samples=int(1e3), **kwargs):
         """
         hutchison trace estimator
         """
@@ -44,6 +44,26 @@ class FlowNet(nn.Module):
         torch.cuda.empty_cache()
 
         return tr
+
+    @torch.no_grad()
+    def divergence_full_jacobian(self, x,t, **kwargs):
+        """
+        Computes the full jacobian and then selects the diagonal
+        """
+
+        jac = jacrev(
+            lambda x, t : self.forward(x.unsqueeze(0), t.unsqueeze(0)).squeeze(0),
+            argnums=0
+        )
+
+        vmapped_jac = vmap(jac, in_dims=(0, 0))
+
+        batched_jacobian = vmapped_jac(x, t) #(b p d p d)
+
+        return torch.einsum(
+            'b p d p d -> b',
+            batched_jacobian
+        )
 
     @torch.no_grad()
     def sample(self, x0, times,**kwargs):
@@ -83,6 +103,26 @@ class FlowNet(nn.Module):
         if 'options' not in kwargs:
             kwargs['options'] = {'step_size': 1 / 100}
 
+        # some logic to determine which divergence to use.
+        div_kwargs = {}
+        if hasattr(self, 'divergence'):
+            self._divergence = self.divergence
+        elif 'div_method' in kwargs:
+                if kwargs['div_method'] == 'hutch':
+                    self._divergence = self.divergence_hutch
+                    if 'div_samples' in kwargs:
+                        div_kwargs['div_samples'] = kwargs.pop('div_samples')
+                elif kwargs['div_method'] == 'full_jacobian':
+                    self._divergence = self.divergence_full_jacobian
+                else:
+                    raise ValueError(f"Unknown divergence method: {kwargs['div_method']}, possible values are 'hutch', 'full_jacobian'")
+                del kwargs['div_method'] # because we pas to odeint after
+        else:
+            print("No divergence method specified, using hutchison trace estimator by default")
+            self._divergence = self.divergence_hutch
+
+        print("Using divergence method:", self._divergence.__name__)
+
         state0 = torch.cat(
             (x0,
             repeat(
@@ -98,7 +138,7 @@ class FlowNet(nn.Module):
             xs = state[:batch_size]
             t_ = torch.ones(batch_size).to(xs) * t.item()
             v = self.forward(xs, t_).detach()
-            div = self.divergence(xs, t_).detach()
+            div = self._divergence(xs, t_, **div_kwargs).detach()
             return torch.cat(
                 (v,
                 repeat(
