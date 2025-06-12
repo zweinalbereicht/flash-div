@@ -40,3 +40,77 @@ def make_periodic(x, boxlength):
     x = x.clone()
     x = x % boxlength
     return x
+
+def threed_rotation(lj_data, nbrot):
+    """
+    Creates more samples by randomly rotating the centered particles in 3D
+    Args:
+        lj_data: [batch_size, nbparticles, dim] where dim=3
+        nbrot: number of rotations to create
+    Returns:
+        target_data_new: [batch_size * nbrot, nbparticles, dim]
+    """
+    nbparticles = lj_data.shape[1]
+    dim = lj_data.shape[2]
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    target_data = lj_data.clone().to(device)
+
+    # Sort by x coordinate
+    target_data = target_data[torch.arange(target_data.size(0)).unsqueeze(-1),
+                             torch.argsort(target_data[:, :, 0], dim=1)]
+
+    # Center the data by subtracting center of mass
+    target_cm = repeat(reduce(target_data, 'b p d -> b 1 d', 'mean'),
+                      'b 1 d -> b p d', p=nbparticles)
+    target_data = target_data - target_cm
+
+    # Expand data for multiple rotations
+    target_data_expanded = repeat(target_data, 'b p d -> b k p d', k=nbrot)
+
+    # Generate random rotation matrices for each batch and rotation
+    batch_size = target_data.shape[0]
+    rotation_matrices = generate_random_rotation_matrices(batch_size, nbrot, device)
+
+    # Apply rotations: [b, k, p, d] @ [b, k, d, d] -> [b, k, p, d]
+    target_data_new = torch.einsum('bkpd,bkde->bkpe', target_data_expanded, rotation_matrices)
+
+    # Reshape to final format
+    target_data_new = rearrange(target_data_new, 'b k p d -> (b k) p d')
+
+    return target_data_new
+
+def generate_random_rotation_matrices(batch_size, nbrot, device):
+    """
+    Generate random 3D rotation matrices using quaternions
+    Args:
+        batch_size: number of batches
+        nbrot: number of rotations per batch
+        device: torch device
+    Returns:
+        rotation_matrices: [batch_size, nbrot, 3, 3]
+    """
+    # Generate random quaternions (4D unit vectors)
+    q = torch.randn(batch_size, nbrot, 4, device=device)
+    q = q / torch.norm(q, dim=-1, keepdim=True)  # Normalize to unit quaternions
+
+    # Extract quaternion components
+    q0, q1, q2, q3 = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+
+    # Convert quaternions to rotation matrices
+    rotation_matrices = torch.zeros(batch_size, nbrot, 3, 3, device=device)
+
+    # Fill rotation matrix elements
+    rotation_matrices[..., 0, 0] = 1 - 2 * (q2**2 + q3**2)
+    rotation_matrices[..., 0, 1] = 2 * (q1 * q2 - q0 * q3)
+    rotation_matrices[..., 0, 2] = 2 * (q1 * q3 + q0 * q2)
+
+    rotation_matrices[..., 1, 0] = 2 * (q1 * q2 + q0 * q3)
+    rotation_matrices[..., 1, 1] = 1 - 2 * (q1**2 + q3**2)
+    rotation_matrices[..., 1, 2] = 2 * (q2 * q3 - q0 * q1)
+
+    rotation_matrices[..., 2, 0] = 2 * (q1 * q3 - q0 * q2)
+    rotation_matrices[..., 2, 1] = 2 * (q2 * q3 + q0 * q1)
+    rotation_matrices[..., 2, 2] = 1 - 2 * (q1**2 + q2**2)
+
+    return rotation_matrices

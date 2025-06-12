@@ -1,4 +1,4 @@
-from flashdiv.flows.flow_net import FlowNet
+from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 import torch.nn as nn
 import torch
 from einops import rearrange
@@ -27,6 +27,8 @@ class MLP(FlowNet):
         self.time_embedding = lambda x, t: torch.cat([x, t], dim=1)
 
     def forward(self, x, t):
+        npart = x.shape[-2]
+        dim = x.shape[-1]
         xt = x.clone()
         x = rearrange(x, 'b part dim -> b (part dim)')
         xt = self.time_embedding(x, t.view(-1, 1))
@@ -34,4 +36,4 @@ class MLP(FlowNet):
         for layer in self.layers:
             xt = layer(xt)
         x = self.decoder(xt)
-        return rearrange(x, 'b (part dim) -> b part dim', dim=2)
+        return rearrange(x, 'b (part dim) -> b part dim', dim=dim)

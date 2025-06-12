@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from flashdiv.flows.flow_net import FlowNet
+from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 
 
 class EGNN_dynamics(FlowNet):
