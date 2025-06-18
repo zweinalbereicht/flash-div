@@ -1,6 +1,7 @@
 from einops import rearrange, repeat, reduce
 import torch
 import numpy as np
+from scipy.stats import multivariate_normal
 
 
 def twod_rotation(lj_data, nbrot):
@@ -114,3 +115,35 @@ def generate_random_rotation_matrices(batch_size, nbrot, device):
     rotation_matrices[..., 2, 2] = 1 - 2 * (q1**2 + q2**2)
 
     return rotation_matrices
+
+def com_logprob(x):
+
+    assert x.dtype == torch.float64, "Input tensor must be of type torch.float64 for numerical stability."
+    # whatch out, need to cast as torch.float64 to avoid numerical issues
+    nbparticles = x.shape[-2]
+    dim = x.shape[-1]
+
+
+    # define the singular covariance matrix
+    bv = repeat(
+        torch.tensor([1,0,0], dtype=float), # if we don't set this it fails because numpy conversion sends to float32 negative values
+        'd -> (p d)',
+        p = nbparticles
+        )
+
+    com_matrix = repeat(
+        torch.vstack([bv, bv.roll(1,0), bv.roll(2,0)]),
+        'p d -> (b p) d',
+        b = nbparticles
+        )
+    com_matrix = (-1 / nbparticles) * com_matrix
+    lin_matrix = torch.eye(com_matrix.shape[0]) + com_matrix
+
+    singular_cov = torch.matmul(lin_matrix, lin_matrix.T)
+    singular_cov = np.array(singular_cov)
+
+
+
+    dist = multivariate_normal(cov=singular_cov , allow_singular=True)
+
+    return dist.logpdf(x.view(-1, nbparticles * dim))
