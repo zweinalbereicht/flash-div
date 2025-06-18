@@ -5,17 +5,46 @@ from pytorch_lightning import LightningModule
 from einops import repeat, rearrange, reduce
 
 class FlowTrainer(LightningModule):
-    def __init__(self, flow_model, learning_rate=1e-3):
+    def __init__(self, flow_model, learning_rate=1e-3, permute=False):
         super().__init__()
         self.flow_model = flow_model
         self.learning_rate = learning_rate
+        self.permute = permute
         self.save_hyperparameters()
+
+    def permute_batch(self, batch):
+
+        batchperm = torch.zeros_like(batch)
+        perms = rearrange(
+            [torch.randperm(batch.shape[1]) for _ in range(batch.shape[0])],
+            'b p -> b p').flatten()
+
+        flattened_range = repeat(
+            torch.arange(batch.shape[0]),
+            'b -> b p ',
+            p = batch.shape[1]
+            ).flatten()
+
+        flattened_parts = repeat(
+            torch.arange(batch.shape[1]),
+            'p -> b p ',
+            b = batch.shape[0]
+            ).flatten()
+
+        batchperm[flattened_range, flattened_parts] = batch[flattened_range, perms]
+        return batchperm.detach()
 
     def forward(self, x, t):
         return self.flow_model(x, t)
 
     def training_step(self, batch, batch_idx):
         base, target = batch
+
+        if self.permute:
+            # permute the batch to avoid symmetry issues
+            #base = self.permute_batch(base)
+            target = self.permute_batch(target)
+
         t = torch.rand(base.shape[0], device=base.device)  # shape: [batch]
         # Broadcast t to shape [batch, N, D] for interpolation
         tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
@@ -38,6 +67,12 @@ class FlowTrainer(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         base, target = batch
+
+        if self.permute:
+            # permute the batch to avoid symmetry issues
+            #base = self.permute_batch(base)
+            target = self.permute_batch(target)
+
         t = torch.rand(base.shape[0], device=base.device)
         tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
         xt = base * (1 - tr) + target * tr
