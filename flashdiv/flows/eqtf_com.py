@@ -6,28 +6,29 @@ from einops import rearrange, repeat, reduce
 import torch.nn.functional as F
 
 class EqTransformerFlowLJ(FlowNet):
-    def __init__(self, input_dim, embed_dim=128):
+    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU()):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
+        self.activation = activation
 
         # we have multipe encoders to avoid the symmetry issue.
         self.encoder =  nn.Sequential(
             nn.Linear(2 + 1, self.embed_dim),
-            nn.ReLU(),
+            self.activation,
             nn.Linear(self.embed_dim, 1)
         )
 
         self.scaler = nn.Sequential(
             nn.Linear(2 + 1, embed_dim),
-            nn.ReLU(),
+            self.activation,
             nn.Linear(embed_dim, 1)
         )
 
         # the "self" scaler function
         self.auto_scaler = nn.Sequential(
             nn.Linear(1 + 1, embed_dim),
-            nn.ReLU(),
+            self.activation,
             nn.Linear(embed_dim, 1)
         )
 
@@ -35,84 +36,6 @@ class EqTransformerFlowLJ(FlowNet):
         self.edges = None
         self._edges_dict = {}
 
-
-    def forward_vmap(self, x, t):
-        """
-        This is a rot and perm equivariant flow field, that uses the "softmax attention mechanism" on featured radial distances.
-        In the Noe paper they compose multiple similar layers, but our bane, or advantage, is that we want only one
-        for quick tract computations.
-
-        Not that we can always put them in parallel. to have potentially more expressivity.
-
-        Inputs
-        x :  (batch_size, nbpart, dim) --> This should scale to nbparticles in nd
-        t :  (batch_size)
-
-        Outputs
-        v :  (batch_size, nbpart, dim)
-        """
-
-
-        n_batch = x.shape[0]
-        n_particles = x.shape[1]
-        # steal MW's trick --> this assigns self.eges the first time.
-        # Doesn't work for batches bcs batch size might very.
-        if self.edges is None:
-            self.edges = self._create_edges(n_particles)
-        batches,edgesi,edgesj = self._cast_edges2batch(self.edges, n_batch, n_particles)
-        edges = [edgesi.to(x.device), edgesj.to(x.device)]
-        batches = batches.to(x.device)
-
-        flat_coord = rearrange(x, 'b p d -> (b p) d')
-        # compute pairwaise distances and direction information
-        radial, coord_diff = self.coord2radial(edges, flat_coord) # one big matrix of size ((b p p) 1)
-        flat_t = repeat(t, 'b -> (b p ) 1', p=(batches==0).sum()) # no cross terms
-
-        flat_features = torch.cat((radial, flat_t), dim=-1)
-        scale = self.scaler(flat_features) #((b p p ) 1)
-        # pass features throught the encoder
-        flat_features = self.encoder(flat_features) #((b p p ) 1)
-        i_mod = edges[0] % n_particles
-        j_mod = edges[1] % n_particles
-        sm = []
-        diffs = []
-        scales = []
-
-        for b in range(n_batch):
-            idx_b = (batches == b)
-            i_b = i_mod[idx_b]
-            j_b = j_mod[idx_b]
-            flat_idx = i_b * n_particles + j_b  # flatten i,j into a single dim
-
-            # Gather per-batch tensors
-            sm_b = torch.zeros((n_particles * n_particles, flat_features.shape[-1]), device=flat_features.device)
-            diffs_b = torch.zeros((n_particles * n_particles, coord_diff.shape[-1]), device=coord_diff.device)
-            scale_b = torch.zeros((n_particles * n_particles, 1), device=scale.device)
-
-            # Use index_add_ (out-of-place update)
-            sm_b = sm_b.index_add(0, flat_idx, flat_features[idx_b])
-            diffs_b = diffs_b.index_add(0, flat_idx, coord_diff[idx_b])
-            scale_b = scale_b.index_add(0, flat_idx, scale[idx_b])
-
-            # Reshape to [P, P, ...]
-            sm.append(sm_b.view(n_particles, n_particles, -1))
-            diffs.append(diffs_b.view(n_particles, n_particles, -1))
-            scales.append(scale_b.view(n_particles, n_particles, 1))
-
-        # Stack results into [B, P, P, ...]
-        sm = torch.stack(sm, dim=0)
-        diffs = torch.stack(diffs, dim=0)
-        scales = torch.stack(scales, dim=0)
-        #softmax
-        sm = F.softmax(sm, dim=-2)
-
-        sm = sm * scales
-        #multiply and sum
-        out = reduce(
-            sm * diffs, # (b, p, p, d),
-            'b p1 p2 d -> b p1 d',
-            'sum')
-        return out
 
     def forward(self, x, t):
         """
@@ -276,36 +199,70 @@ class EqTransformerFlowLJ(FlowNet):
         batches,edgesi,edgesj = self._cast_edges2batch(self.edges, n_batch, n_particles)
         edges = [edgesi.to(x.device), edgesj.to(x.device)]
         batches = batches.to(x.device)
-        flat_coord = rearrange(x, 'b p d -> (b p) d')
-        # compute pairwaise distances and direction information
-        radial, coord_diff = self.coord2radial(edges, flat_coord) # one big matrix of size ((b p p) 1)
 
-        # requires grad on radial
-        radial.requires_grad_(True)
-
-        flat_t = repeat(t, 'b -> (b p ) 1', p=(batches==0).sum()) # no cross terms
-        flat_features = torch.cat((radial, flat_t), dim=-1)
-        scale = self.scaler(flat_features) #((b p p ) 1)
-
-        # compute gradient of scale.sum() w.r.t. radial
-        (dscale,) = torch.autograd.grad(
-            outputs=scale.sum(),
-            inputs=radial,
-            create_graph=True
+        com = repeat(
+            reduce(
+                x,
+                'b p d -> b d',
+                'mean'),
+            'b d -> b p d',
+            p=n_particles  # number of particles in the batch
         )
 
-        # pass features through the encoder
-        flat_features = self.encoder(flat_features)  # ((b p p) 1)
+        # shift everything by com
+        flat_coord = rearrange(
+            x - com,
+            'b p d -> (b p) d'
+        )
 
-        # compute gradient of flat_features.sum() w.r.t. radial
-        (dfeat,) = torch.autograd.grad(
+        radial, dotproduct, coord_diff = self.coord2raddotproduct(edges, flat_coord) # one big matrix of size ((b p p) 1)
+        radial.requires_grad_(True)
+        dotproduct.requires_grad_(True)
+        flat_t = repeat(t, 'b -> (b p ) 1', p=(batches==0).sum()) # no cross terms
+
+        flat_features = torch.cat((radial, dotproduct, flat_t), dim=-1)
+
+        scale = self.scaler(flat_features) #((b p p ) 1)
+        # pass features throught the encoder
+        flat_features = self.encoder(flat_features) #((b p p ) 1)
+
+        #compute derivatives
+        # compute gradient of scale.sum() w.r.t. radial
+        (dscalerad,) = torch.autograd.grad(
+            outputs=scale.sum(),
+            inputs=radial,
+            create_graph=False,
+            retain_graph=True
+        )
+
+
+        (dscaledot,) = torch.autograd.grad(
+            outputs=scale.sum(),
+            inputs=dotproduct,
+            create_graph=False,
+            retain_graph=True
+        )
+
+        # radial.detach().requires_grad_(True)
+        # dotproduct.detach().requires_grad_(True)
+
+        dfeatrad, = torch.autograd.grad(
             outputs=flat_features.sum(),
             inputs=radial,
-            create_graph=True
-)
+            create_graph=False,
+            retain_graph=True
+        )
+
+        dfeatdot, = torch.autograd.grad(
+            outputs=flat_features.sum(),
+            inputs=dotproduct,
+            create_graph=False,
+            retain_graph=True
+        )
 
 
-        # now we have to reshape to do a soft max operation.
+
+
 
         # these might have an extra particle, but it can be a problem for later.
         sm = torch.zeros(
@@ -319,9 +276,10 @@ class EqTransformerFlowLJ(FlowNet):
             dtype=flat_features.dtype
         )
         scales = torch.zeros_like(sm, device=x.device, dtype=flat_features.dtype)
-        dscales = torch.zeros_like(sm, device=x.device, dtype=dscale.dtype)
-        dfeatures = torch.zeros_like(sm, device=x.device, dtype=dfeat.dtype)
-
+        dscalesdot = torch.zeros_like(sm, device=x.device, dtype=flat_features.dtype)
+        dscalesrad = torch.zeros_like(sm, device=x.device, dtype=flat_features.dtype)
+        dfeaturesdot = torch.zeros_like(sm, device=x.device, dtype=flat_features.dtype)
+        dfeaturesrad = torch.zeros_like(sm, device=x.device, dtype=flat_features.dtype)
 
         # fill in alll the arrays needed
         i_mod = edges[0] % n_particles
@@ -329,11 +287,20 @@ class EqTransformerFlowLJ(FlowNet):
         sm[batches, i_mod, j_mod] = flat_features
         diffs[batches, i_mod, j_mod] = coord_diff
         scales[batches, i_mod, j_mod] = scale
-        dscales[batches, i_mod, j_mod] = dscale
-        dfeatures[batches, i_mod, j_mod] = dfeat
+        dscalesdot[batches, i_mod, j_mod] = dscaledot
+        dscalesrad[batches, i_mod, j_mod] = dscalerad
+        dfeaturesdot[batches, i_mod, j_mod] = dfeatdot
+        dfeaturesrad[batches, i_mod, j_mod] = dfeatrad
+
+        ## we also need to construct the drad and dtot vectors
+        drad = 2 * diffs # easy
+        ddot_ = flat_coord[edges[1]] - 1 / n_particles *  (flat_coord[edges[0]] + flat_coord[edges[1]]) # com contributions
+        ddot = torch.zeros_like(drad, device=x.device, dtype=ddot_.dtype)
+        ddot[batches, i_mod, j_mod] = ddot_
 
         #softmax
         sm = F.softmax(sm, dim=-2)
+
 
         # divergence vector to be filled
         divergence = torch.zeros(
@@ -345,15 +312,16 @@ class EqTransformerFlowLJ(FlowNet):
 
         #linear term
 
-        divergence += reduce(
+        divergence = divergence +  reduce(
             sm * scales,  # (b, p, p, d),
             'b p1 p2 d -> b p1 d',
             'sum'
         )
 
         #scales term
-        divergence += reduce(
-            2 * diffs ** 2 * dscales * sm,
+        divergence = divergence +  reduce(
+            diffs * sm * (dscalesrad * drad + dscalesdot * ddot),
+            # 2 * diffs ** 2 * dscales * sm,
             'b p1 p2 d -> b p1 d',
             'sum'
         )
@@ -362,27 +330,57 @@ class EqTransformerFlowLJ(FlowNet):
 
         # non cross terms
         sm_ = repeat(
-            (- sm * dfeatures * 2 * diffs).sum(-2) ,
+            (- sm * (dfeaturesrad * drad + dfeaturesdot * ddot)).sum(-2) ,
             'b p1 d -> b p1 p2 d',
             p2=n_particles
         )
 
-        divergence += reduce(
+        divergence = divergence +  reduce(
             (sm_ * sm * scales * diffs),
             'b p1 p2 d -> b p1 d',
             'sum'
             )
 
         #cross terms
-        divergence += reduce(
-            (sm * scales * dfeatures * 2 *  diffs ** 2),
+        divergence = divergence + reduce(
+            diffs * scales * sm  * (dfeaturesrad * drad + dfeaturesdot * ddot),
             'b p1 p2 d -> b p1 d',
             'sum'
             )
 
-        divergence = reduce(
-            divergence,
+
+
+        # need to do the autoparticle contribution
+        #last is the selft contribution
+        auto_norms = (flat_coord ** 2).sum(-1, keepdim=True) + 1e-8
+        auto_norms.requires_grad_(True)
+
+        flat_t = repeat(t, 'b -> (b p ) 1', p=n_particles) # no cross terms
+        # print(auto_norms.shape, flat_t.shape)
+        # flat_t = repeat(t, 'b -> (b p) 1', p=(batches==0).sum()) # no cross terms
+        auto_scale = self.auto_scaler(
+            torch.cat((auto_norms, flat_t), dim=-1)
+        )
+
+        dautoscalednorm,= torch.autograd.grad(
+            outputs=auto_scale.sum(),
+            inputs=auto_norms,
+            create_graph=False,
+            retain_graph=True
+        )
+
+        dnorm = 2 * flat_coord * (1 - 1 / n_particles)
+
+        auto_div = rearrange(
+            torch.ones_like(flat_coord) * (1 - 1 / n_particles) * auto_scale + flat_coord * dautoscalednorm * dnorm,
+            '(b p) d -> b p d',
+            b=n_batch, p=n_particles
+        )
+
+        divergence_ = reduce(
+            divergence + auto_div,
             'b p d -> b',
             'sum'
         )
-        return divergence
+
+        return divergence_

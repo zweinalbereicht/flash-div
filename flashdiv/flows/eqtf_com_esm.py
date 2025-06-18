@@ -10,14 +10,12 @@ from pytorch_lightning import Trainer, LightningModule
 
 
 
-
-
 class EqtfCOMEsm(FlowNet):
-    def __init__(self, input_dim, embed_dim=128):
+    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU()):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
-        self.activation = nn.ReLU()
+        self.activation = activation
 
         # we have multipe encoders to avoid the symmetry issue.
         self.encoder =  nn.Sequential(
