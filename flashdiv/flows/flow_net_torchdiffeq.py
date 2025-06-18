@@ -90,7 +90,7 @@ class FlowNet(nn.Module):
 
 
     # @torch.no_grad()
-    def sample_logprob(self, x0, logprob0, times,**kwargs):
+    def sample_logprob(self, x0, logprob0, times, verbose=False,**kwargs):
         """
         ODE integration returning the trajectory and logprob
         """
@@ -105,9 +105,7 @@ class FlowNet(nn.Module):
 
         # some logic to determine which divergence to use.
         div_kwargs = {}
-        if hasattr(self, 'divergence'):
-            self._divergence = self.divergence
-        elif 'div_method' in kwargs:
+        if 'div_method' in kwargs:
                 if kwargs['div_method'] == 'hutch':
                     self._divergence = self.divergence_hutch
                     if 'div_samples' in kwargs:
@@ -117,11 +115,14 @@ class FlowNet(nn.Module):
                 else:
                     raise ValueError(f"Unknown divergence method: {kwargs['div_method']}, possible values are 'hutch', 'full_jacobian'")
                 del kwargs['div_method'] # because we pas to odeint after
+        elif hasattr(self, 'divergence'):
+            self._divergence = self.divergence
         else:
             print("No divergence method specified, using hutchison trace estimator by default")
             self._divergence = self.divergence_hutch
 
-        print("Using divergence method:", self._divergence.__name__)
+        if verbose:
+            print("Using divergence method:", self._divergence.__name__)
 
         state0 = torch.cat(
             (x0,
