@@ -5,11 +5,12 @@ from pytorch_lightning import LightningModule
 from einops import repeat, rearrange, reduce
 
 class FlowTrainer(LightningModule):
-    def __init__(self, flow_model, learning_rate=1e-3, permute=False):
+    def __init__(self, flow_model, learning_rate=1e-3, permute=False, sigma = 0):
         super().__init__()
         self.flow_model = flow_model
         self.learning_rate = learning_rate
         self.permute = permute
+        self.sigma = sigma  # Standard deviation for noise
         self.save_hyperparameters()
 
     def permute_batch(self, batch):
@@ -48,8 +49,8 @@ class FlowTrainer(LightningModule):
         t = torch.rand(base.shape[0], device=base.device)  # shape: [batch]
         # Broadcast t to shape [batch, N, D] for interpolation
         tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
-        xt = base * (1 - tr) + target * tr  # [batch, N, D]
-        xt.requires_grad_()
+        xt = base * (1 - tr) + target * tr + self.sigma * torch.randn_like(base)  # [batch, N, D]
+        # xt.requires_grad_()
         v = target - base
         vt = self.flow_model(xt, t)
         loss = nn.MSELoss()(v,vt)  # Example loss: minimize velocity magnitude
@@ -75,7 +76,7 @@ class FlowTrainer(LightningModule):
 
         t = torch.rand(base.shape[0], device=base.device)
         tr = t.view(-1, 1, 1)  # shape: [batch, 1, 1]
-        xt = base * (1 - tr) + target * tr
+        xt = base * (1 - tr) + target * tr + self.sigma * torch.randn_like(base)  # [batch, N, D]
         v = target - base
         vt = self.flow_model(xt, t)
         loss = nn.MSELoss()(v,vt)  # Example loss: minimize velocity magnitude
