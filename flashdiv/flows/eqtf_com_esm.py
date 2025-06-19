@@ -8,6 +8,26 @@ from einops import rearrange, repeat, reduce, einsum
 from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 from pytorch_lightning import Trainer, LightningModule
 
+class ParallelEqtfCOMEsm(FlowNet):
+    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU(), nb_units=1, device='cuda'):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.activation = activation
+        self.nb_units = nb_units
+        self.units = nn.ModuleList([EqtfCOMEsm(self.input_dim, self.embed_dim, self.activation).to(device) for _ in range(self.nb_units)])
+
+    def forward(self, x, t):
+        out = torch.zeros_like(x)
+        for unit in self.units:
+            out = out + unit(x, t)
+        return out
+
+    def divergence(self, x, t):
+        out = torch.zeros(x.shape[0]).to(x)
+        for unit in self.units:
+            out = out + unit.divergence(x, t)
+        return out
 
 
 class EqtfCOMEsm(FlowNet):

@@ -5,12 +5,35 @@ from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 from einops import rearrange, repeat, reduce
 import torch.nn.functional as F
 
-class EqTransformerFlowLJ(FlowNet):
-    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU()):
+class ParallelEqTransformerFlowLJ(FlowNet):
+    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU(),auto_scale=True, nb_units=1, device='cuda'):
         super().__init__()
         self.input_dim = input_dim
         self.embed_dim = embed_dim
         self.activation = activation
+        self.nb_units = nb_units
+        self.auto_scale = auto_scale
+        self.units = nn.ModuleList([EqTransformerFlowLJ(self.input_dim, self.embed_dim, self.activation, auto_scale=self.auto_scale).to(device) for _ in range(self.nb_units)])
+
+    def forward(self, x, t):
+        out = torch.zeros_like(x)
+        for unit in self.units:
+            out = out + unit(x, t)
+        return out
+
+    def divergence(self, x, t):
+        out = torch.zeros(x.shape[0]).to(x)
+        for unit in self.units:
+            out = out + unit.divergence(x, t)
+        return out
+
+class EqTransformerFlowLJ(FlowNet):
+    def __init__(self, input_dim, embed_dim=128, activation=nn.ReLU(), auto_scale=True):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.activation = activation
+        self.auto_scale = auto_scale
 
         # we have multipe encoders to avoid the symmetry issue.
         self.encoder =  nn.Sequential(
@@ -25,12 +48,13 @@ class EqTransformerFlowLJ(FlowNet):
             nn.Linear(embed_dim, 1)
         )
 
-        # the "self" scaler function
-        self.auto_scaler = nn.Sequential(
-            nn.Linear(1 + 1, embed_dim),
-            self.activation,
-            nn.Linear(embed_dim, 1)
-        )
+        # the "self" scaler function --> unclear if it's necessary
+        if self.auto_scale:
+            self.auto_scaler = nn.Sequential(
+                nn.Linear(1 + 1, embed_dim),
+                self.activation,
+                nn.Linear(embed_dim, 1)
+            )
 
 
         self.edges = None
@@ -115,23 +139,23 @@ class EqTransformerFlowLJ(FlowNet):
             'b p1 p2 d -> b p1 d',
             'sum')
 
+        if self.auto_scale:
+            # do the single partticle contribution
+            auto_norms = (flat_coord ** 2).sum(-1, keepdim=True) + 1e-8
 
-        # do the single partticle contribution
-        auto_norms = (flat_coord ** 2).sum(-1, keepdim=True) + 1e-8
+            flat_t = repeat(t, 'b -> (b p ) 1', p=n_particles) # no cross terms
+            # print(auto_norms.shape, flat_t.shape)
+            # flat_t = repeat(t, 'b -> (b p) 1', p=(batches==0).sum()) # no cross terms
+            auto_scale = self.auto_scaler(
+                torch.cat((auto_norms, flat_t), dim=-1)
+            )
+            # print(auto_norms.shape, auto_scale.shape, flat_coord.shape)
 
-        flat_t = repeat(t, 'b -> (b p ) 1', p=n_particles) # no cross terms
-        # print(auto_norms.shape, flat_t.shape)
-        # flat_t = repeat(t, 'b -> (b p) 1', p=(batches==0).sum()) # no cross terms
-        auto_scale = self.auto_scaler(
-            torch.cat((auto_norms, flat_t), dim=-1)
-        )
-        # print(auto_norms.shape, auto_scale.shape, flat_coord.shape)
-
-        out = out + rearrange(
-            flat_coord * auto_scale,
-            '(b p) d -> b p d',
-            b=n_batch, p=n_particles
-        )
+            out = out + rearrange(
+                flat_coord * auto_scale,
+                '(b p) d -> b p d',
+                b=n_batch, p=n_particles
+            )
 
 
         return out
@@ -348,39 +372,40 @@ class EqTransformerFlowLJ(FlowNet):
             'sum'
             )
 
-
-
         # need to do the autoparticle contribution
-        #last is the selft contribution
-        auto_norms = (flat_coord ** 2).sum(-1, keepdim=True) + 1e-8
-        auto_norms.requires_grad_(True)
+        if self.auto_scale:
 
-        flat_t = repeat(t, 'b -> (b p ) 1', p=n_particles) # no cross terms
-        # print(auto_norms.shape, flat_t.shape)
-        # flat_t = repeat(t, 'b -> (b p) 1', p=(batches==0).sum()) # no cross terms
-        auto_scale = self.auto_scaler(
-            torch.cat((auto_norms, flat_t), dim=-1)
-        )
+            auto_norms = (flat_coord ** 2).sum(-1, keepdim=True) + 1e-8
+            auto_norms.requires_grad_(True)
 
-        dautoscalednorm,= torch.autograd.grad(
-            outputs=auto_scale.sum(),
-            inputs=auto_norms,
-            create_graph=False,
-            retain_graph=True
-        )
+            flat_t = repeat(t, 'b -> (b p ) 1', p=n_particles) # no cross terms
+            # print(auto_norms.shape, flat_t.shape)
+            # flat_t = repeat(t, 'b -> (b p) 1', p=(batches==0).sum()) # no cross terms
+            auto_scale = self.auto_scaler(
+                torch.cat((auto_norms, flat_t), dim=-1)
+            )
 
-        dnorm = 2 * flat_coord * (1 - 1 / n_particles)
+            dautoscalednorm,= torch.autograd.grad(
+                outputs=auto_scale.sum(),
+                inputs=auto_norms,
+                create_graph=False,
+                retain_graph=True
+            )
 
-        auto_div = rearrange(
-            torch.ones_like(flat_coord) * (1 - 1 / n_particles) * auto_scale + flat_coord * dautoscalednorm * dnorm,
-            '(b p) d -> b p d',
-            b=n_batch, p=n_particles
-        )
+            dnorm = 2 * flat_coord * (1 - 1 / n_particles)
 
-        divergence_ = reduce(
-            divergence + auto_div,
+            auto_div = rearrange(
+                torch.ones_like(flat_coord) * (1 - 1 / n_particles) * auto_scale + flat_coord * dautoscalednorm * dnorm,
+                '(b p) d -> b p d',
+                b=n_batch, p=n_particles
+            )
+
+            divergence = divergence + auto_div
+
+        divergence = reduce(
+            divergence,
             'b p d -> b',
             'sum'
         )
 
-        return divergence_
+        return divergence
