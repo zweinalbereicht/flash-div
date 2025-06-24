@@ -66,6 +66,19 @@ class FlowNet(nn.Module):
         )
 
     @torch.no_grad()
+    def direct_trace(self, x,t, **kwargs):
+        """
+        Computes the full jacobian and then selects the diagonal
+        """
+        def f(x):
+            return self.forward(x, t)
+        shape = x.shape
+        def _func_sum(x):
+            return f(x.reshape(shape)).sum(dim=0).flatten()
+        jacobian = torch.autograd.functional.jacobian(_func_sum, x.reshape(x.shape[0],-1), create_graph=False).transpose(0,1)
+        return torch.vmap(torch.trace)(jacobian).flatten()
+
+    @torch.no_grad()
     def sample(self, x0, times,**kwargs):
         """
         input : x0 (batch_size, napart, dim)
@@ -112,6 +125,8 @@ class FlowNet(nn.Module):
                         div_kwargs['div_samples'] = kwargs.pop('div_samples')
                 elif kwargs['div_method'] == 'full_jacobian':
                     self._divergence = self.divergence_full_jacobian
+                elif kwargs['div_method'] == 'direct_trace':
+                    self._divergence = self.direct_trace
                 else:
                     raise ValueError(f"Unknown divergence method: {kwargs['div_method']}, possible values are 'hutch', 'full_jacobian'")
                 del kwargs['div_method'] # because we pas to odeint after
