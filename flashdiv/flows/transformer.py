@@ -2,6 +2,78 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from einops import repeat, rearrange
+from flashdiv.flows.flow_net_torchdiffeq import FlowNet
+
+class TransformerFlow(FlowNet):
+    def __init__(self, input_dim, embed_dim, key_dim,  seq_length=1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.seq_length = seq_length
+        self.embed_dim = embed_dim
+        self.key_dim = key_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(self.input_dim + 1 , self.embed_dim),
+            )
+
+        self.decoder = nn.Linear(self.embed_dim, input_dim)
+        self.Q = nn.Linear(self.embed_dim, self.key_dim, bias=False)
+        self.K = nn.Linear(self.embed_dim, self.key_dim, bias=False)
+        self.V = nn.Linear(self.embed_dim, self.embed_dim)
+
+    def forward(self, x, t):
+        """
+        Inputs
+        x :  (batch_size, input_dim, 1) --> weird but we want to try it in 2d first
+        t :  (batch_size)
+
+        Outputs
+        v :  (batch_size, input_dim)
+        """
+
+        B,P,D = x.shape
+        repeat_t = repeat(t, 'b -> b p 1', p = P)
+        xt = torch.cat((x.clone(), repeat_t), dim=2)
+        # print(xt[0])
+        # print(xt.shape)
+        xt_encoded = self.encoder(
+            rearrange(xt, 'b p d -> (b p) d')
+        )
+
+        query = rearrange(
+            self.Q(xt_encoded),
+            '(b p) d -> b p d',
+            p = P
+        )
+
+
+        key = rearrange(
+            self.K(xt_encoded),
+            '(b p) d -> b p d',
+            p = P
+        )
+
+        value = rearrange(
+            self.V(xt_encoded),
+            '(b p) d -> b p d',
+            p = P
+        )
+
+
+        scaled_dot_product = F.scaled_dot_product_attention(query, key, value)
+
+        # print(scaled_dot_product.shape)
+        out = rearrange(
+            self.decoder(
+                rearrange(scaled_dot_product, 'b p d -> (b p) d')
+            ),
+            '(b p) d -> b p d',
+            p = P
+        )
+
+
+        return out
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -23,7 +95,7 @@ class FourierFeatures(nn.Module):
         """
         d = x.shape[-1]
         nfreqs = self.dim // (2*d)
-        freqs = torch.pow(self.sigma, torch.arange(start=0, end=nfreqs, dtype=torch.float32) 
+        freqs = torch.pow(self.sigma, torch.arange(start=0, end=nfreqs, dtype=torch.float32)
         ).to(device=x.device)
         args = x[:,:, None].float() * freqs[None,None,:,None] *2* math.pi / self.period
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).flatten(start_dim=2)
@@ -154,7 +226,7 @@ class EncoderLayer(nn.Module):
         if not(self.is_final_layer):
             #self-attention
             attn_output, attn = self.slf_attn(
-                x_modulated, mask=slf_attn_mask)      
+                x_modulated, mask=slf_attn_mask)
             x = x+gate_attn.unsqueeze(1)*attn_output  #residual connection
             # postionwise feed forward
             pff_output = self.pos_ffn(modulate(self.norm2(x),shift=shift_pff, scale=scale_pff))
@@ -198,7 +270,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.network(x)
-    
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -237,7 +309,7 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
-    
+
 class Transformer(nn.Module):
     ''' A encoder model with self attention mechanism. '''
 
