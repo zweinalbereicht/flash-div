@@ -26,14 +26,16 @@ class MessagePassing(FlowNet):
         self.potential_d = potential_d  # output potential size
         self.layers = layers  # number of message passing layers
 
+        # take time away in embeddings
         self.edge_embedding = nn.Sequential(
-        nn.Linear(1+1, self.edge_feature_d),
+        nn.Linear(1, self.edge_feature_d),
         # nn.ReLU(),
         # nn.Linear(self.edge_feature_d, self.edge_feature_d)
         ).to(device)
 
+        # take time away in embeddings
         self.node_embedding = nn.Sequential(
-        nn.Linear(1 + 1, self.node_feature_d),
+        nn.Linear(1, self.node_feature_d),
         # nn.ReLU(),
         # nn.Linear(self.node_feature_d, self.node_feature_d)
         ).to(device)  # output node feature size
@@ -42,21 +44,29 @@ class MessagePassing(FlowNet):
         self.node_decoding = nn.Sequential(
             nn.Linear(self.node_feature_d, self.out_node_d)).to(device)
 
-        self.message_model = nn.Sequential(
-            nn.Linear(2 * self.node_feature_d + self.edge_feature_d + 1, self.message_feature_d),
-            nn.ReLU(),
-            nn.Linear(self.message_feature_d, self.message_feature_d),
-        ).to(device)
+        self.message_models = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(2 * self.node_feature_d + self.edge_feature_d + 1, self.message_feature_d),
+                nn.ReLU(),
+                nn.Linear(self.message_feature_d, self.message_feature_d),
+            ).to(device) for _ in range(self.layers)
+        ])
 
-        self.fused_message_model = nn.Sequential(
-            nn.Linear(self.message_feature_d + 1, self.fused_message_feature_d),
-            nn.ReLU(),
-            nn.Linear(self.fused_message_feature_d, self.fused_message_feature_d)).to(device)  # output message feature size
+        self.fused_message_models = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.message_feature_d + 1, self.fused_message_feature_d),
+                nn.ReLU(),
+                nn.Linear(self.fused_message_feature_d, self.fused_message_feature_d)
+            ).to(device) for _ in range(self.layers)
+        ])
 
-        self.node_model = nn.Sequential(
-            nn.Linear(self.node_feature_d + self.fused_message_feature_d + 1, self.node_feature_d ),
-            nn.ReLU(),
-            nn.Linear(self.node_feature_d , self.node_feature_d)).to(device)  # output node feature size
+        self.node_models = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.node_feature_d + self.fused_message_feature_d + 1, self.node_feature_d),
+                nn.ReLU(),
+                nn.Linear(self.node_feature_d, self.node_feature_d)
+            ).to(device) for _ in range(self.layers)
+        ])
 
         # this is the final potential --> could be any sort of potential with fixed parameters.
         # We make it more complicated here to allow for more complex potentials.
@@ -121,18 +131,20 @@ class MessagePassing(FlowNet):
         tnodes = t.reshape(B, 1,1, 1).expand(B, P, P-1, 1).reshape(B * P * (P-1), 1) #(B * P * (P-1), 1)  # time feature, broadcasted to match subgraph shape
 
         # we should start with node features all equivalent
-        node_features = self.node_embedding(torch.cat((torch.ones_like(tnodes), tnodes), dim=-1))  # for now
-        edge_features = self.edge_embedding(torch.cat((rij, tedges), dim=-1))  # for now
+        node_features = self.node_embedding(torch.ones_like(tnodes))  # identical at first
+        edge_features = self.edge_embedding(rij)  # for now
 
         for k in range(self.layers):
             # print(f"Layer {k+1}/{self.layers}")
 
-            messages = self.message_model(torch.cat((node_features[ei], node_features[ej], edge_features, tedges), dim = -1)) #mij
+            messages = self.message_models[k](torch.cat((node_features[ei], node_features[ej], edge_features, tedges), dim = -1)) #mij
 
             # aggregate
-            fused_messages = self.fused_message_model(torch.cat((messages, tedges), dim=-1))  # fuse messages with time feature
-            agg = self.unsorted_segment_sum(fused_messages, ei, num_segments=subgraph_x_flat.size(0)) # mi
-            node_features = self.node_model(torch.cat((node_features, agg, tnodes), dim=-1))  # update node features
+            # fused_messages = self.fused_message_models[k](torch.cat((messages, tedges), dim=-1))  # fuse messages with time feature
+
+            agg = self.unsorted_segment_sum(messages, ei, num_segments=subgraph_x_flat.size(0)) # simple sum in the aggregation for now
+            # print(f"agg shape: {agg.shape}, node_features shape: {node_features.shape}, tnodes shape: {tnodes.shape}")
+            node_features = self.node_models[k](torch.cat((node_features, agg, tnodes), dim=-1))  # update node features
 
         out = self.node_decoding(node_features)  # decode node features to output
         potential_params = out.reshape(B, P, P-1, -1)  # reshape to match subgraph shape

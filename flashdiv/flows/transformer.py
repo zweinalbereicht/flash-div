@@ -6,10 +6,9 @@ from einops import repeat, rearrange
 from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 
 class TransformerFlow(FlowNet):
-    def __init__(self, input_dim, embed_dim, key_dim,  seq_length=1):
+    def __init__(self, input_dim, embed_dim, key_dim):
         super().__init__()
         self.input_dim = input_dim
-        self.seq_length = seq_length
         self.embed_dim = embed_dim
         self.key_dim = key_dim
 
