@@ -69,6 +69,9 @@ class EGNN_dynamicsPeriodic(FlowNet):
         # we need to rearange all the xs so each particle is sort of "in the middle"
         particle_diffs = xs - source_xs.unsqueeze(-2).expand(-1, -1, P-1, -1)  # shape: (B, P, P, D)
 
+        particle_diffs = particle_diffs % self.boxlength  # wrap around the box
+
+
         to_subtract = ((torch.abs(particle_diffs)> 0.5 * self.boxlength)
                         * torch.sign(particle_diffs) * self.boxlength)
         particle_diffs = particle_diffs - to_subtract # right direction
@@ -119,19 +122,21 @@ class EGNN_dynamicsPeriodic(FlowNet):
         h_final = h_final.reshape(B, P, self.max_nb_neighbors, -1) # reshape to match subgraph shape
         vel = vel.reshape(B, P, self.max_nb_neighbors, D) # should work
 
-
+        # I'm not sure we want that here...
         # we need to rearange all the xs so each particle is sort of "in the middle"
         vel_ = vel - source_xs.unsqueeze(-2).expand(-1, -1, self.max_nb_neighbors, -1)  # shape: (B, P, P, D)
 
-        to_subtract = ((torch.abs(vel_)> 0.5 * self.boxlength)
-                        * torch.sign(vel_) * self.boxlength)
-        vel_ = vel_ - to_subtract # right direction
-        vel = vel_ + source_xs.unsqueeze(-2).expand(-1, -1, self.max_nb_neighbors, -1)  # replace the ghost particles as if the source was centered
+        # Let's just hope the flow fields are in the right direction here.
+        # vel_ = vel_ % self.boxlength  # wrap around the box
+        # to_subtract = ((torch.abs(vel_)> 0.5 * self.boxlength)
+        #                 * torch.sign(vel_) * self.boxlength)
+        # vel_ = vel_ - to_subtract # right direction
+        # vel = vel_ + source_xs.unsqueeze(-2).expand(-1, -1, self.max_nb_neighbors, -1)  # replace the ghost particles as if the source was centered
         # replace the particles as if they were "centered"
 
 
         # we probably don't want a com here ? or do we ?
-        diffij = source_xs_com.unsqueeze(2).expand(B, P, self.max_nb_neighbors, D) - vel
+        diffij = vel - source_xs_com.unsqueeze(2).expand(B, P, self.max_nb_neighbors, D)
         rij = rearrange(
             diffij.norm(dim=-1),
             'b p p2 -> (b p p2) 1')
@@ -143,15 +148,17 @@ class EGNN_dynamicsPeriodic(FlowNet):
                 t_,
                 h_final.reshape(-1, h_final.shape[-1])), dim=-1)).reshape(B, P, self.max_nb_neighbors, 1)
 
-        # print(rcom.shape,t.reshape(-1, 1,1).expand(-1, P,  1).reshape(-1,1).shape,  h_final[:,:,:,-1].shape)
-        com_pot = self.pot_com_model(
-            torch.cat((
-                rcom.reshape(-1, 1),
-                t.reshape(-1, 1,1).expand(-1, P,  1).reshape(-1,1), #(B * P, 1)
-                h_final[:,:,:,-1].reshape(B * P, -1),
-            ), dim=-1)).reshape(B, P, 1)  # compute coercive potential
+        # no com for periodic systems I think.
+        # # print(rcom.shape,t.reshape(-1, 1,1).expand(-1, P,  1).reshape(-1,1).shape,  h_final[:,:,:,-1].shape)
+        # com_pot = self.pot_com_model(
+        #     torch.cat((
+        #         rcom.reshape(-1, 1),
+        #         t.reshape(-1, 1,1).expand(-1, P,  1).reshape(-1,1), #(B * P, 1)
+        #         h_final[:,:,:,-1].reshape(B * P, -1),
+        #     ), dim=-1)).reshape(B, P, 1)  # compute coercive potential
 
-        vel = (diffij * pot).sum(dim=2) + (com_pot * source_xs_com) # sum over the P-1 particles
+        # vel = (diffij * pot).sum(dim=2) + (com_pot * source_xs_com) # sum over the P-1 particles
+        vel = (diffij * pot).sum(dim=2)
         self.counter += 1
         return vel
 
@@ -165,7 +172,14 @@ class EGNN_dynamicsPeriodic(FlowNet):
         B, P, D = x.shape
 
         # Compute pairwise distances for the whole batch at once
-        dist = torch.cdist(x, x)  # shape (B, P, P)
+
+        # need to do it in a periodic way
+        pvec = x.unsqueeze(-3) - x.unsqueeze(-2)  # shape (B, P, P, D)
+        pvec = pvec % self.boxlength  # wrap around the box
+        to_subtract = ((torch.abs(pvec) > 0.5 * self.boxlength) * torch.sign(pvec) * self.boxlength)
+        pvec = pvec - to_subtract  # right direction
+        dist = torch.norm(pvec, dim=-1)  # shape (B, P, P)
+        # dist = torch.cdist(x, x)  # shape (B, P, P)
 
         # Create a batch-wide diagonal mask to exclude self-loops
         device = x.device
