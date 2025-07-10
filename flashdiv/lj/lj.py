@@ -1,6 +1,7 @@
 import torch
 import math
 import numpy as np
+from flashdiv.lj.sampling import even_spacing
 
 class BaseDistribution(torch.nn.Module):
     def __init__(self, nparticles=4, dim=2, batch_size=10, device='cuda'):
@@ -160,12 +161,20 @@ class LJ(BaseDistribution):
             total_force += self.harmonic_force(particle_pos)
         return total_force
 
+    # unfortunately this one breaks when particles start to be too far away.
     def pair_vec(self,particle_pos):
-        pair_vec = (particle_pos.unsqueeze(-2) - particle_pos.unsqueeze(-3))
+        # start by sending them all inside the box
         if self.periodic:
+            # print('in here')
+            # first bring them in the same box
+            particle_pos = particle_pos % self.boxlength
+            pair_vec = (particle_pos.unsqueeze(-2) - particle_pos.unsqueeze(-3))
+
             to_subtract = ((torch.abs(pair_vec)> 0.5 * self.boxlength)
-                        * torch.sign(pair_vec) * self.boxlength)
+                        * torch.sign(pair_vec) * self.boxlength ) # we need to account for rogue particles. Putting the COM is not enough
             pair_vec -= to_subtract
+        else:
+            pair_vec = (particle_pos.unsqueeze(-2) - particle_pos.unsqueeze(-3))
         return pair_vec
 
     def g_r(self,particle_pos, bins=100):
@@ -197,3 +206,28 @@ class LJ(BaseDistribution):
             areas = 4*math.pi*((bins[:-1]+bins[1:])/2)**2*(bins[1:]-bins[:-1])
             g_r = counts/nsamples/areas/bulk_density
         return bins, g_r
+
+    def sample_wrapped_gaussian(self, std, size=1, device=None):
+        """
+        Sample from an N-D Gaussian and wrap the result into a box of size `wrap`.
+        Args:
+            mean: array-like, shape (dim,)
+            cov: array-like, shape (dim, dim)
+            wrap: float, the box size to wrap into (default 2*pi)
+            size: int, number of samples
+            device: torch.device or None
+        Returns:
+            samples: torch.Tensor, shape (size, particles, dim)
+        """
+
+        mean = even_spacing(self.nparticles, self.boxlength, self.dim).flatten()
+        cov = np.eye(mean.shape[0]) * std ** 2
+        mean = np.asarray(mean)
+        cov = np.asarray(cov)
+        dim = mean.shape[0]
+        samples = np.random.multivariate_normal(mean, cov, size=size)
+        samples_wrapped = np.mod(samples, self.boxlength)
+        samples_wrapped = torch.tensor(samples_wrapped, dtype=torch.float32)
+        if device is not None:
+            samples_wrapped = samples_wrapped.to(device)
+        return samples_wrapped.reshape(-1, self.nparticles, self.dim)

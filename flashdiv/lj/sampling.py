@@ -1,6 +1,6 @@
 import torch, argparse, os
 import numpy as np
-from lj import LJ
+# from flashdiv.lj.lj import LJ
 import matplotlib.pyplot as plt
 from numpy.lib.format import open_memmap
 
@@ -82,6 +82,7 @@ def even_spacing(nparticles, boxlength, dim):
                         raise BreakAllLoops()
                     positions[idx] = np.array([i, j]) * spacing
 
+
     except BreakAllLoops:
         pass
     return positions
@@ -117,7 +118,7 @@ def parse_args():
 def run_MH(target, x_init, n_steps, dt, adaptive=True, save_every=100, burn_in=1000, xs=None):
     '''
     MH sampler with burn-in, adaptive dt, and memory-mapped storage.
-    
+
     target: has .potential(x) and .kT
     x_init: initial tensor of shape (batch, N, dim)
     xs: np.memmap array for saving samples (must be preallocated)
@@ -235,32 +236,32 @@ def run_MALA(target, x_init, n_steps, dt, adaptive=True,
     return xs, acc/n_steps
 
 
-if __name__=="__main__":
-    args = parse_args()
-    periodic = False if args.boxlength is None else True
-    sys = LJ(nparticles=args.nparticles, dim=args.dim, batch_size=args.batch_size,
-                  device="cuda", boxlength=args.boxlength, kT=args.kT,
-                  epsilon=1., sigma=1., cutoff=3, shift=False,
-                  periodic=periodic,spring_constant=args.spring_constant)
-    #initialize the particles on a lattice
-    #x_init = torch.tensor(create_fcc_lattice(args.nparticles, args.boxlength)).to("cuda:0")
-    if args.boxlength is None:
-        boxlength = 3.0
-    else:
-        boxlength = args.boxlength
-    x_init = torch.tensor(even_spacing(args.nparticles, boxlength, args.dim)).to("cuda:0")
-    #x_init = torch.tensor(even_spacing(args.nparticles, args.boxlength, args.dim)).to("cpu")
-    x_init = x_init.unsqueeze(0).expand(args.batch_size,-1,-1)
-    x_init = x_init + torch.rand_like(x_init)*torch.sqrt(torch.tensor(2*args.kT*0.001))
-    shape = (args.num_steps//args.save_every,args.batch_size,args.nparticles,args.dim)
-    print(args.adaptive_step_size)
-    traj_list = np.memmap(f'{args.logname}_{args.kT}_temp.npy', dtype='float32', mode='w+', shape=shape)
-    if args.sampler == 'MH':
-        traj_list, acc = run_MH(sys, x_init, args.num_steps, args.step_size, args.adaptive_step_size,
-                                args.save_every, args.burn_in, traj_list)
-    elif args.sampler == 'MALA':
-        traj_list, acc = run_MALA(sys, x_init, args.num_steps, args.step_size, args.adaptive_step_size,
-                                   args.save_every, args.burn_in, traj_list, center_com=True)
-    y = open_memmap(f'{args.logname}_{args.kT}.npy', mode='w+', dtype=traj_list.dtype, shape=traj_list.shape)
-    y[:] = traj_list[:]
-    print(acc)
+# if __name__=="__main__":
+#     args = parse_args()
+#     periodic = False if args.boxlength is None else True
+#     sys = LJ(nparticles=args.nparticles, dim=args.dim, batch_size=args.batch_size,
+#                   device="cuda", boxlength=args.boxlength, kT=args.kT,
+#                   epsilon=1., sigma=1., cutoff=3, shift=False,
+#                   periodic=periodic,spring_constant=args.spring_constant)
+#     #initialize the particles on a lattice
+#     #x_init = torch.tensor(create_fcc_lattice(args.nparticles, args.boxlength)).to("cuda:0")
+#     if args.boxlength is None:
+#         boxlength = 3.0
+#     else:
+#         boxlength = args.boxlength
+#     x_init = torch.tensor(even_spacing(args.nparticles, boxlength, args.dim)).to("cuda:0")
+#     #x_init = torch.tensor(even_spacing(args.nparticles, args.boxlength, args.dim)).to("cpu")
+#     x_init = x_init.unsqueeze(0).expand(args.batch_size,-1,-1)
+#     x_init = x_init + torch.rand_like(x_init)*torch.sqrt(torch.tensor(2*args.kT*0.001))
+#     shape = (args.num_steps//args.save_every,args.batch_size,args.nparticles,args.dim)
+#     print(args.adaptive_step_size)
+#     traj_list = np.memmap(f'{args.logname}_{args.kT}_temp.npy', dtype='float32', mode='w+', shape=shape)
+#     if args.sampler == 'MH':
+#         traj_list, acc = run_MH(sys, x_init, args.num_steps, args.step_size, args.adaptive_step_size,
+#                                 args.save_every, args.burn_in, traj_list)
+#     elif args.sampler == 'MALA':
+#         traj_list, acc = run_MALA(sys, x_init, args.num_steps, args.step_size, args.adaptive_step_size,
+#                                    args.save_every, args.burn_in, traj_list, center_com=True)
+#     y = open_memmap(f'{args.logname}_{args.kT}.npy', mode='w+', dtype=traj_list.dtype, shape=traj_list.shape)
+#     y[:] = traj_list[:]
+#     print(acc)

@@ -89,15 +89,36 @@ class FlowNet(nn.Module):
         batch_size = x0.shape[0]
         npart = x0.shape[-2]
         dim = x0.shape[-1]
+        print(kwargs)
+        boxlength = kwargs.pop('boxlength', None)
 
         if 'method' not in  kwargs:
             kwargs['method'] = 'euler'
         # print(kwargs)
 
         # little reshaping here
-        def integration_func(t, xs):
-            t_ = torch.ones(batch_size).to(xs) * t.item()
-            return self.forward(xs, t_).detach()
+        # inorder to have some callback to the forward method we need to define this as a class
+
+        # we do this so we can pass some callbacks
+        class IntegrationFunc:
+            def __init__(self, model):
+                self.model = model
+
+            def __call__(self, t, xs):
+                # print('calling')
+                t_ = torch.ones(batch_size).to(xs) * t.item()
+                return self.model.forward(xs, t_).detach()
+
+        integration_func = IntegrationFunc(self)
+
+        # watch out, I had to modify the core code for callback to act on the state
+        if boxlength is not None:
+
+            # this is an inplace modification of xs
+            def mod(xs):
+                xs%=boxlength
+
+            setattr(integration_func, 'callback_step', lambda t, xs, dt: mod(xs)) # this is an inplace operation on xs, which we carry on throught the next integration step
 
         return odeint(integration_func, x0, times, **kwargs)
 
@@ -128,7 +149,7 @@ class FlowNet(nn.Module):
                 elif kwargs['div_method'] == 'direct_trace':
                     self._divergence = self.direct_trace
                 else:
-                    raise ValueError(f"Unknown divergence method: {kwargs['div_method']}, possible values are 'hutch', 'full_jacobian'")
+                    raise ValueError(f"Unknown divergence method: {kwargs['div_method']}, possible values are 'hutch', 'full_jacobian, direct_trace'")
                 del kwargs['div_method'] # because we pas to odeint after
         elif hasattr(self, 'divergence'):
             self._divergence = self.divergence
