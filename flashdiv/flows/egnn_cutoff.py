@@ -124,7 +124,7 @@ class EGNN_dynamicsPeriodic(FlowNet):
 
         # I'm not sure we want that here...
         # we need to rearange all the xs so each particle is sort of "in the middle"
-        vel_ = vel - source_xs.unsqueeze(-2).expand(-1, -1, self.max_nb_neighbors, -1)  # shape: (B, P, P, D)
+        # vel_ = vel - source_xs.unsqueeze(-2).expand(-1, -1, self.max_nb_neighbors, -1)  # shape: (B, P, P, D)
 
         # Let's just hope the flow fields are in the right direction here.
         # vel_ = vel_ % self.boxlength  # wrap around the box
@@ -161,6 +161,105 @@ class EGNN_dynamicsPeriodic(FlowNet):
         vel = (diffij * pot).sum(dim=2)
         self.counter += 1
         return vel
+
+    def divergence(self, xs, t):
+
+        # create subgraphs
+        source_xs = xs.clone()
+        B, P, D = xs.shape
+        xs = repeat(xs, 'b p d -> b p1 p d', p1=P)
+        mask = torch.eye(P, device=self.device, dtype=bool).reshape(1, xs.shape[1], xs.shape[1], 1).expand(B, -1, -1, D)
+        xs = xs[~mask].reshape(B, P, P-1, D)
+
+        # we need to rearange all the xs so each particle is sort of "in the middle"
+        particle_diffs = xs - source_xs.unsqueeze(-2).expand(-1, -1, P-1, -1)  # shape: (B, P, P, D)
+
+        particle_diffs = particle_diffs % self.boxlength  # wrap around the box
+
+
+        to_subtract = ((torch.abs(particle_diffs)> 0.5 * self.boxlength)
+                        * torch.sign(particle_diffs) * self.boxlength)
+        particle_diffs = particle_diffs - to_subtract # right direction
+
+        del to_subtract  # free memory
+
+        # replace the particles as if they were "centered"
+        xs = source_xs.unsqueeze(-2).expand(-1, -1, P-1, -1) + particle_diffs
+
+        distances = (xs - source_xs.unsqueeze(2)).norm(dim=-1)  # shape: (B, P, P-1)
+        distances, idx = distances.sort(dim=2)
+        # Select the P-1 closest particles for each particle
+
+
+        idx = idx[:, :, :self.max_nb_neighbors]  # shape: (B, P, P-1)
+        xs = torch.gather(xs, 2, idx.unsqueeze(-1).expand(-1, -1, -1, D))
+
+        del idx
+
+        com = xs.mean(dim=2)
+        source_xs_com = source_xs - com
+
+        # rcom = source_xs_com.norm(dim=-1, keepdim=True)  # (B,P,1)
+        # print(xs.shape)
+        xs = rearrange(xs, 'b p1 p2 d -> (b p1) p2 d') # we will pass this through the egnn
+        xs = xs - xs.mean(dim=1, keepdim=True)  # remove mean
+
+        n_batch = xs.shape[0]
+        t = t.reshape(-1, 1)
+        #edges_full = self._cast_edges2batch(self.edges, n_batch, self._n_particles)
+        edges = self.compute_edges(xs, cutoff=self.cutoff)
+        edges = [edges[0], edges[1]]
+        # x = xs.reshape(n_batch*self._n_particles, self._n_dimension).clone()
+        x = xs.reshape(-1, self._n_dimension).clone()
+        # h = torch.ones(n_batch, self._n_particles).to(self.device)
+        h = torch.ones(n_batch, self.max_nb_neighbors).to(self.device)
+
+        if self.condition_time:
+            t_ = repeat(t, 'b 1 -> (b p) 1', p=P)
+            h = h * t_
+        h = h.reshape(-1, 1)
+        if self.mode == 'egnn_dynamics':
+            edge_attr = torch.sum((x[edges[0]] - x[edges[1]])**2, dim=1, keepdim=True)
+            h_final, x_final = self.egnn(h, x, edges, edge_attr=edge_attr)
+
+            # only take xfinal here instead of diff
+            vel = x_final
+
+        h_final = h_final.reshape(B, P, self.max_nb_neighbors, -1) # reshape to match subgraph shape
+        vel = vel.reshape(B, P, self.max_nb_neighbors, D) # should work
+
+        diffij = vel - source_xs_com.unsqueeze(2).expand(B, P, self.max_nb_neighbors, D)
+
+        divergence = torch.zeros(B, P).to(diffij.device) #(B, P, P-1 , D)
+
+        # locally enable gradient computation
+        with torch.enable_grad():
+
+            rij = rearrange(
+                diffij.norm(dim=-1),
+                'b p p2 -> (b p p2) 1').requires_grad_(True)  # (B * P, P-1, 1)
+
+            # the goal is to have the least amount of memory usage so we detach anything that is not essential.
+            t_ = t.reshape(-1,1,1).expand(-1, P,  self.max_nb_neighbors).reshape(-1,1).detach() # (B P, P-1)should be same shape as rij
+            h_final.detach()
+
+            pot = self.pot_model(
+                torch.cat((
+                    rij,
+                    t_,
+                    h_final.reshape(-1, h_final.shape[-1])), dim=-1)).reshape(B, P, self.max_nb_neighbors, 1)
+
+            dpotdr = torch.autograd.grad(pot.sum(), rij, create_graph=False)[0].reshape(B, P, self.max_nb_neighbors, 1).detach()
+            rij.detach()  # detach to avoid memory leak
+
+        # don't forget the chain rule here
+        divergence = divergence + (
+            pot +
+            (diffij * dpotdr  * diffij / (rij.reshape(B, P, self.max_nb_neighbors, 1) + 1e-8))).sum((-1, -2))  # (B, P, P-1, 1)
+
+        del dpotdr, rij, pot  # free memory
+
+        return - divergence.sum(dim=-1)  # sum over the P particles
 
     def compute_edges(self, x, cutoff):
         """

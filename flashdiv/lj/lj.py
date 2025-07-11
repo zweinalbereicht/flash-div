@@ -2,6 +2,9 @@ import torch
 import math
 import numpy as np
 from flashdiv.lj.sampling import even_spacing
+from mpmath import jtheta # wrapped gaussian computations
+import mpmath as mp
+mp.dps = 25
 
 class BaseDistribution(torch.nn.Module):
     def __init__(self, nparticles=4, dim=2, batch_size=10, device='cuda'):
@@ -207,7 +210,7 @@ class LJ(BaseDistribution):
             g_r = counts/nsamples/areas/bulk_density
         return bins, g_r
 
-    def sample_wrapped_gaussian(self, std, size=1, device=None):
+    def sample_wrapped_gaussian(self, std, size=1, device=None, logprobs = False):
         """
         Sample from an N-D Gaussian and wrap the result into a box of size `wrap`.
         Args:
@@ -220,14 +223,32 @@ class LJ(BaseDistribution):
             samples: torch.Tensor, shape (size, particles, dim)
         """
 
+        # this is a wrapped gaussian pdf
+        def f(x, mu):
+            q = np.exp(- (std / self.boxlength * 2 * np.pi) ** 2 / 2)
+            z = np.pi * (x-mu) / self.boxlength
+            return float(jtheta(3, z, q) / (self.boxlength))
+
         mean = even_spacing(self.nparticles, self.boxlength, self.dim).flatten()
+        # print(mean)
         cov = np.eye(mean.shape[0]) * std ** 2
         mean = np.asarray(mean)
         cov = np.asarray(cov)
-        dim = mean.shape[0]
+        # dim = mean.shape[0]
         samples = np.random.multivariate_normal(mean, cov, size=size)
+        # print(samples - )
         samples_wrapped = np.mod(samples, self.boxlength)
         samples_wrapped = torch.tensor(samples_wrapped, dtype=torch.float32)
+        # print(samples_wrapped.shape, torch.tensor(mean).unsqueeze(0).expand(size, -1).shape)
+        # compute sample log prob
+
+        if logprobs:
+            logprobs_ = torch.log(torch.tensor([f(s.item(), m.item()) for s, m in zip(samples_wrapped.flatten(), torch.tensor(mean).unsqueeze(0).expand(size, -1).flatten())]))
+            logprobs_ = logprobs_.reshape(size, self.nparticles, self.dim).sum(dim=(-1,-2))
+        else:
+            logprobs_ = torch.zeros(size, device=samples_wrapped.device)
+
         if device is not None:
             samples_wrapped = samples_wrapped.to(device)
-        return samples_wrapped.reshape(-1, self.nparticles, self.dim)
+            logprobs_ = logprobs_.to(device)
+        return  samples_wrapped.reshape(-1, self.nparticles, self.dim), logprobs_

@@ -131,6 +131,8 @@ class FlowNet(nn.Module):
         batch_size = x0.shape[0]
         npart = x0.shape[-2]
         dim = x0.shape[-1]
+        print(kwargs)
+        boxlength = kwargs.pop('boxlength', None)
 
         if 'method' not in  kwargs:
             kwargs['method'] = 'euler'
@@ -170,21 +172,52 @@ class FlowNet(nn.Module):
             dim=0
         )
 
-        # little reshaping here
-        def integration_func(t, state):
-            xs = state[:batch_size]
-            t_ = torch.ones(batch_size).to(xs) * t.item()
-            v = self.forward(xs, t_).detach()
-            div = self._divergence(xs, t_, **div_kwargs).detach()
-            return torch.cat(
-                (v,
-                repeat(
-                    - div,
-                    'b -> b p d',
-                    p=npart, d=dim
-                )),
-                dim=0
-            ).detach()
+        # # little reshaping here
+        # def integration_func(t, state):
+        #     xs = state[:batch_size]
+        #     t_ = torch.ones(batch_size).to(xs) * t.item()
+        #     v = self.forward(xs, t_).detach()
+        #     div = self._divergence(xs, t_, **div_kwargs).detach()
+        #     return torch.cat(
+        #         (v,
+        #         repeat(
+        #             - div,
+        #             'b -> b p d',
+        #             p=npart, d=dim
+        #         )),
+        #         dim=0
+        #     ).detach()
+
+        class IntegrationFunc:
+            def __init__(self, model):
+                self.model = model
+
+            def __call__(self, t, state):
+                # print('calling')
+                xs = state[:batch_size]
+                t_ = torch.ones(batch_size).to(xs) * t.item()
+                v = self.model.forward(xs, t_).detach()
+                div = self.model._divergence(xs, t_, **div_kwargs).detach()
+                t_ = torch.ones(batch_size).to(xs) * t.item()
+                return torch.cat(
+                    (v,
+                    repeat(
+                        - div,
+                        'b -> b p d',
+                        p=npart, d=dim
+                    )),
+                    dim=0
+                ).detach()
+
+        integration_func = IntegrationFunc(self)
+
+        # watch out, I had to modify the core code for callback to act on the state
+        if boxlength is not None:
+            # this is an inplace modification of xs
+            def mod(xs):
+                # only mod the positions
+                xs[:batch_size] %= boxlength
+            setattr(integration_func, 'callback_step', lambda t, xs, dt: mod(xs)) # this is an inplace operation on xs, which we carry on throught the next integration step
 
         integrated_state = odeint(integration_func, state0, times, **kwargs)
         all_xs = integrated_state[:, :batch_size]
