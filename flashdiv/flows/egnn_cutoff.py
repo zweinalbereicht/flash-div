@@ -4,12 +4,26 @@ from flashdiv.flows.flow_net_torchdiffeq import FlowNet
 from einops import rearrange, repeat, reduce
 
 class EGNN_dynamicsPeriodic(FlowNet):
-    def __init__(self, n_particles, n_dimension, hidden_nf=64, device='cpu',
+    def __init__(self, n_particles, n_dimension, hidden_nf=64, device='cpu',distribution=None,
             act_fn=torch.nn.SiLU(), n_layers=4, recurrent=True, attention=False, cutoff=None,max_neighbors=None,
-                 condition_time=True, tanh=False, mode='egnn_dynamics', agg='sum', out_node_nf=None, boxlength=None):
+                 condition_time=True, tanh=False, mode='egnn_dynamics', agg='sum', out_node_nf=None, boxlength=None, **kwargs):
         super().__init__()
         print('Initializing custom EGNN_dynamics')
         self.mode = mode
+
+        # dirty hack to monitor the contribution of the lj potential.
+        self.distribution = distribution
+
+        if 'sched_cutoff' in kwargs:
+            self.sched_cutoff = kwargs.pop('sched_cutoff')
+        else :
+            self.sched_cutoff = 0.3
+
+        if 'lj_weight' in kwargs:
+            self.lj_weight = kwargs.pop('lj_weight')
+        else :
+            self.lj_weight = 0.0
+
         self.out_node_nf = out_node_nf
         if mode == 'egnn_dynamics':
             self.egnn = EGNN(in_node_nf=1, in_edge_nf=1, hidden_nf=hidden_nf, device=device, act_fn=act_fn, n_layers=n_layers, recurrent=recurrent, attention=attention, tanh=tanh, agg=agg, out_node_nf=self.out_node_nf)
@@ -159,6 +173,40 @@ class EGNN_dynamicsPeriodic(FlowNet):
 
         # vel = (diffij * pot).sum(dim=2) + (com_pot * source_xs_com) # sum over the P-1 particles
         vel = (diffij * pot).sum(dim=2)
+
+        if self.distribution is not None:
+
+
+
+            schedule = t.flatten()  # shape: [B]
+
+            # Mask: t > 0.3
+
+            mask = (schedule > self.sched_cutoff)
+
+            # Filter t and source_xs
+            schedule_filtered = schedule[mask]
+            source_xs_filtered = source_xs[mask]
+
+            schedule_rescaled = (schedule_filtered - self.sched_cutoff) / (1.0 - self.sched_cutoff)  # in (0,1]
+
+            # Apply sharp ramp, e.g., with high power
+            schedule_sharp = 1 - schedule_rescaled**3
+
+            force_correction = self.distribution.force_softcore(source_xs_filtered, schedule_sharp)
+
+            if torch.isnan(force_correction).any():
+                print("NaN detected in force_correction")
+                print("source_xs_filtered:", source_xs_filtered)
+                print("schedule_sharp:", schedule_sharp)
+                print("force_correction:", force_correction)
+                raise ValueError("NaN detected in force_correction")
+
+            # Apply back to full velocity only at masked locations
+            vel[mask] =  vel[mask] - (self.lj_weight) * torch.clamp(0.01*force_correction, -1, 1)
+            # vel[mask] = vel[mask] - 0.01*force_correction
+            # vel[mask] = - torch.clamp(0.01*force_correction, -10, 10)
+
         self.counter += 1
         return vel
 
@@ -255,11 +303,64 @@ class EGNN_dynamicsPeriodic(FlowNet):
         # don't forget the chain rule here
         divergence = divergence + (
             pot +
-            (diffij * dpotdr  * diffij / (rij.reshape(B, P, self.max_nb_neighbors, 1) + 1e-8))).sum((-1, -2))  # (B, P, P-1, 1)
+            (diffij * dpotdr  * diffij / (rij.reshape(B, P, self.max_nb_neighbors, 1) + 1e-8))).sum((-1, -2))  # (B, P)
 
         del dpotdr, rij, pot  # free memory
 
-        return - divergence.sum(dim=-1)  # sum over the P particles
+        # reshape divergence and add minus sign
+        divergence = - divergence.sum(-1)  # (B)
+
+        if self.distribution is not None:
+            with torch.enable_grad():
+                schedule = t.flatten()  # shape: [B]
+
+
+
+                # Mask: t > 0.3
+
+                mask = (schedule > self.sched_cutoff)
+                if mask.sum() > 0 :
+                    # print(mask.sum())
+                # print(source_xs.shape, mask.shape)
+
+                    # Filter t and source_xs
+                    schedule_filtered = schedule[mask]
+                    source_xs_filtered = source_xs[mask]
+                    # print(source_xs_filtered)
+
+                    schedule_rescaled = (schedule_filtered - self.sched_cutoff) / (1.0 - self.sched_cutoff)  # in (0,1]
+
+                    # Apply sharp ramp, e.g., with high power
+                    schedule_sharp = 1 - schedule_rescaled**3
+
+                    # force_correction = self.distribution.force_softcore(source_xs_filtered, schedule_sharp)
+
+                    # if torch.isnan(force_correction).any():
+                    #     print("NaN detected in force_correction")
+                    #     print("source_xs_filtered:", source_xs_filtered)
+                    #     print("schedule_sharp:", schedule_sharp)
+                    #     print("force_correction:", force_correction)
+                    #     raise ValueError("NaN detected in force_correction")
+
+                    # # Apply back to full velocity only at masked locations
+
+                    # vel[mask] = vel[mask] - force_correction
+                    # clamp_mask = 0.01 * force_correction.abs() > 10
+
+                    def f(x):
+                        return torch.clamp(0.01 * self.distribution.force_softcore(x, schedule_sharp), -1, 1)
+                    shape = source_xs_filtered.shape
+                    def _func_sum(x):
+                        return f(x.reshape(shape)).sum(dim=0).flatten()
+                    jacobian = torch.autograd.functional.jacobian(_func_sum, source_xs_filtered.reshape(source_xs_filtered.shape[0],-1), create_graph=False).transpose(0,1)
+                    divergencecorrection = torch.vmap(torch.trace)(jacobian).flatten().detach()
+                    # brutal clamping
+                    # divergencecorrection[clamp_mask] = 0.0
+
+                    divergence[mask] = divergence[mask] - self.lj_weight * divergencecorrection  # messed up signs and clamping issue
+                    del jacobian, _func_sum, f  # free memory
+
+        return  divergence  # sum over the P particles
 
     def compute_edges(self, x, cutoff):
         """
